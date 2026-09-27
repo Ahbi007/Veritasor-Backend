@@ -783,13 +783,16 @@ describe("DrrScheduler — representative invalid inputs and state transitions",
 
     scheduler.enqueue(makeItem("a", "a", "a1"));
     scheduler.enqueue(makeItem("b", "b", "b1"));
-    scheduler.dequeueBatch(1);
+    // Drains a1 only, leaving b1 queued.
+    expect(scheduler.dequeueBatch(1)).toHaveLength(1);
+    expect(scheduler.totalDepth()).toBe(1);
 
     scheduler.enqueue(makeItem("a", "a", "a2"));
     scheduler.enqueue(makeItem("b", "b", "b2"));
+    // a=[a2], b=[b1,b2] -> 3 items remain, fewer than the requested 4.
     const batch = scheduler.dequeueBatch(4);
 
-    expect(batch).toHaveLength(4);
+    expect(batch).toHaveLength(3);
     expect(scheduler.totalDepth()).toBe(0);
   });
 
