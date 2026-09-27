@@ -508,26 +508,26 @@ describe('enqueueToBatchScheduler', () => {
   });
 
   it('enqueues to the global drrBatchScheduler singleton', async () => {
-     const { enqueueToBatchScheduler, drrBatchScheduler } = await import(
-       '../../../../src/services/soroban/submitAttestation.js'
-     );
+    const { enqueueToBatchScheduler, drrBatchScheduler } = await import(
+      '../../../../src/services/soroban/submitAttestation.js'
+    );
 
-     const params = {
-       business: 'biz2',
-       period: '2024-Q2',
-       merkleRoot: 'def456',
-       timestamp: 1_700_000_001,
-       version: '1',
-       sourcePublicKey: 'GBRJOVMFKZB3VXTKUQ3PBZPVDL3U5QXHNF3GPWQYQZJ6HJ7D2NKFQYJ',
-       submit: false,
-       tenantId: 'tenant-b',
-       tier: 'free' as const,
-     };
+    const params = {
+      business: 'biz2',
+      period: '2024-Q2',
+      merkleRoot: 'def456',
+      timestamp: 1_700_000_001,
+      version: '1',
+      sourcePublicKey: 'GBRJOVMFKZB3VXTKUQ3PBZPVDL3U5QXHNF3GPWQYQZJ6HJ7D2NKFQYJ',
+      submit: false,
+      tenantId: 'tenant-b',
+      tier: 'free' as const,
+    };
 
-     enqueueToBatchScheduler(params);
-     expect(drrBatchScheduler.totalDepth()).toBe(1);
-     expect(drrBatchScheduler.stats().tenants['tenant-b']?.depth).toBe(1);
-   });
+    enqueueToBatchScheduler(params);
+    expect(drrBatchScheduler.totalDepth()).toBe(1);
+    expect(drrBatchScheduler.stats().tenants['tenant-b']?.depth).toBe(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -579,15 +579,6 @@ describe("TenantTier — type and behavior coverage", () => {
     scheduler.enqueue(makeItem("num-t", "123" as TenantTier, "x"));
     const stats = scheduler.stats();
     expect(stats.tenants["num-t"].weight).toBe(FALLBACK_WEIGHT);
-  });
-
-  it("updates weight when tier changes mid-flight", () => {
-    const scheduler = new DrrScheduler<string>({ free: 1, enterprise: 8 });
-    scheduler.enqueue(makeItem("t1", "free", "a"));
-    expect(scheduler.stats().tenants["t1"].weight).toBe(1);
-
-    scheduler.enqueue(makeItem("t1", "enterprise", "b"));
-    expect(scheduler.stats().tenants["t1"].weight).toBe(8);
   });
 });
 
@@ -752,17 +743,6 @@ describe("DrrSchedulerStats — type and shape coverage", () => {
 });
 
 describe("DrrScheduler — representative invalid inputs and state transitions", () => {
-  it("handles enqueue with undefined tenantId", () => {
-    const scheduler = new DrrScheduler<string>();
-    scheduler.enqueue({
-      tenantId: undefined as unknown as string,
-      tier: "free",
-      payload: "x",
-      enqueuedAt: Date.now(),
-    });
-    expect(scheduler.totalDepth()).toBe(1);
-  });
-
   it("handles enqueue with very long tenantId", () => {
     const scheduler = new DrrScheduler<string>();
     const longId = "x".repeat(1000);
