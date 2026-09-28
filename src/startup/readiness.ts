@@ -17,6 +17,7 @@
  *   - All decisions are emitted as structured log entries for observability.
  */
 
+import { db } from "../db/client.js"
 import { logger } from "../utils/logger.js"
 
 // ---------------------------------------------------------------------------
@@ -44,6 +45,7 @@ export type DependencyName =
   | "config/jwt"
   | "config/soroban"
   | "config/stripe"
+  | "config/mtls"
   | "database"
 
 /**
@@ -110,10 +112,12 @@ export async function runStartupDependencyReadinessChecks(): Promise<StartupRead
   // 3. Stripe Config check
   checks.push(checkStripeConfig(isProduction))
 
-  // 4. Database check
-  const dbConnectionString = process.env.DATABASE_URL?.trim()
-  if (dbConnectionString) {
-    checks.push(await checkDatabaseConnectivity(dbConnectionString))
+  // 4. mTLS Config check
+  checks.push(checkMtlsConfig(isProduction))
+
+  // 5. Database check
+  if (process.env.DATABASE_URL?.trim()) {
+    checks.push(await checkDatabase())
   }
 
   const allReady = checks.every((c) => c.ready)
@@ -122,6 +126,65 @@ export async function runStartupDependencyReadinessChecks(): Promise<StartupRead
     ready: allReady,
     checks,
   }
+}
+
+/**
+ * Validate mTLS configuration.
+ *
+ * If MTLS_ENABLED=true requires MTLS_CA_PATH, MTLS_CERT_PATH, and MTLS_KEY_PATH.
+ * If MTLS_OCSP_ENABLED=true also requires MTLS_CRL_PATH for fallback revocation checks.
+ */
+function checkMtlsConfig(_isProduction: boolean): DependencyReadinessResult {
+  const mtlsEnabled = process.env.MTLS_ENABLED?.trim().toLowerCase() === "true";
+  const spiffeEnabled =
+    process.env.MTLS_SPIFFE_ENABLED?.trim().toLowerCase() === "true";
+
+  if (!mtlsEnabled) {
+    return { dependency: "config/mtls", ready: true };
+  }
+
+  if (spiffeEnabled) {
+    const trustDomain = process.env.SPIFFE_TRUST_DOMAIN?.trim();
+    const workloadSocket = process.env.SPIFFE_WORKLOAD_API_SOCKET?.trim()
+      ?? "unix:///tmp/spire-agent/public/api.sock";
+
+    if (!trustDomain) {
+      return {
+        dependency: "config/mtls",
+        ready: false,
+        reason: "SPIFFE_TRUST_DOMAIN must be set when MTLS_SPIFFE_ENABLED=true",
+      };
+    }
+  }
+
+  // OCSP/CRL fallback revocation checking applies to mTLS generally, not just
+  // the SPIFFE workload-identity path, so this must run outside the
+  // spiffeEnabled branch above.
+  const ocspEnabled = process.env.MTLS_OCSP_ENABLED?.trim().toLowerCase() === "true"
+  const crlPath = process.env.MTLS_CRL_PATH?.trim()
+
+  if (ocspEnabled && !crlPath) {
+    return {
+      dependency: "config/mtls",
+      ready: false,
+      reason: "MTLS_CRL_PATH must be set when MTLS_OCSP_ENABLED=true",
+    }
+  }
+
+  const caPath = process.env.MTLS_CA_PATH?.trim();
+  const certPath = process.env.MTLS_CERT_PATH?.trim();
+  const keyPath = process.env.MTLS_KEY_PATH?.trim();
+
+  if (!caPath || !certPath || !keyPath) {
+    return {
+      dependency: "config/mtls",
+      ready: false,
+      reason:
+        "MTLS_CA_PATH, MTLS_CERT_PATH, and MTLS_KEY_PATH must be set when MTLS_ENABLED=true and MTLS_SPIFFE_ENABLED is not true",
+    };
+  }
+
+  return { dependency: "config/mtls", ready: true };
 }
 
 
@@ -174,48 +237,25 @@ function checkStripeConfig(isProduction: boolean): DependencyReadinessResult {
 }
 
 /**
- * Probe database connectivity with a bounded SELECT 1 query.
+ * Probe database connectivity using the shared db client with a bounded SELECT 1 query.
  *
- * Returns an explicit failure reason that identifies whether the failure
- * was a connection error or a query timeout  without leaking the
- * connection string or credentials.
+ * Uses the shared `db` singleton from client.ts rather than opening a one-off
+ * connection, so the probe exercises the same connection path as normal
+ * request handling.
+ *
+ * Returns an explicit failure reason without leaking credentials.
  */
-async function checkDatabaseConnectivity(connectionString: string): Promise<DependencyReadinessResult> {
-  let failureReason: string
-
+export async function checkDatabase(): Promise<DependencyReadinessResult> {
   try {
-    const { default: pg } = await import("pg")
-    const client = new pg.Client({ connectionString })
-
-    await withTimeout(
-      (async () => {
-        await client.connect()
-        try {
-          await client.query("SELECT 1")
-        } finally {
-          await client.end()
-        }
-      })(),
-      STARTUP_CHECK_TIMEOUT_MS,
-    )
-
+    await withTimeout(db.query("SELECT 1"), STARTUP_CHECK_TIMEOUT_MS)
     return { dependency: "database", ready: true }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-
-    if (message === "timeout") {
-      failureReason = `database probe timed out after ${STARTUP_CHECK_TIMEOUT_MS} ms`
-    } else {
-      // Sanitise: strip the connection string from the error message so
-      // credentials are never written to logs.
-      failureReason = "database connection failed: " + sanitiseDbError(message)
-    }
-
-    return {
-      dependency: "database",
-      ready: false,
-      reason: failureReason,
-    }
+    const reason =
+      message === "timeout"
+        ? `database probe timed out after ${STARTUP_CHECK_TIMEOUT_MS} ms`
+        : "database connection failed: " + sanitiseDbError(message)
+    return { dependency: "database", ready: false, reason }
   }
 }
 

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   PermissionService,
+  requireBusinessTierRolePromotionPermission,
   requirePermissions
 } from "../../src/middleware/permissions.js";
 import {
@@ -35,7 +36,7 @@ describe("PermissionService", () => {
       const permissions = PermissionService.getUserPermissions("admin");
 
       expect(permissions).toContain(IntegrationPermission.ADMIN);
-      expect(permissions.length).toBe(Object.values(IntegrationPermission).length);
+      expect(permissions.length).toEqual(Object.values(IntegrationPermission).length);
     });
 
     it("should return empty array for invalid role", () => {
@@ -301,7 +302,7 @@ describe("requirePermissions middleware", () => {
       customCheck,
     });
 
-    mockReq.params = { id: "biz_123_int" };
+    mockReq.params = { integrationId: "biz_123_int" };
     mockReq.headers = { "x-business-id": "biz_123" };
 
     await middleware(mockReq as Request, mockRes as Response, mockNext);
@@ -317,7 +318,7 @@ describe("requirePermissions middleware", () => {
       customCheck,
     });
 
-    mockReq.params = { id: "biz_123_int" };
+    mockReq.params = { integrationId: "biz_123_int" };
     mockReq.headers = { "x-business-id": "biz_123" };
 
     await middleware(mockReq as Request, mockRes as Response, mockNext);
@@ -330,7 +331,7 @@ describe("requirePermissions middleware", () => {
       checkOwnership: true,
     });
 
-    // No params.id set
+    // No params.integrationId set
     await middleware(mockReq as Request, mockRes as Response, mockNext);
 
     expect(mockNext).toHaveBeenCalled(); // Should pass since no ownership check needed
@@ -349,5 +350,14 @@ describe("requirePermissions middleware", () => {
       error: "Internal Server Error",
       message: "Error checking permissions",
     });
+  });
+
+  it("should expose a dedicated admin guard for business-tier role promotion", async () => {
+    mockReq.user = { id: "admin_123", userId: "admin_123", email: "admin@example.com", role: "admin" as any };
+
+    await requireBusinessTierRolePromotionPermission(mockReq as Request, mockRes as Response, mockNext);
+
+    expect(mockNext).toHaveBeenCalled();
+    expect(mockReq.permissionContext?.permissions).toContain(IntegrationPermission.ADMIN_MANAGE_USERS);
   });
 });

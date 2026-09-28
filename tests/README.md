@@ -267,6 +267,8 @@ Unit tests in `tests/unit/middleware/validate.test.ts` cover `validateBody` and 
 
 All application logs flow through `src/utils/logger.ts`, which emits one structured JSON object per line and automatically merges the request-scoped `correlationId` into logs written during the request, including auth, attestation, and webhook handlers.
 
+When `OTEL_EXPORTER_OTLP_ENDPOINT` is configured, `requestLogger` also starts an OpenTelemetry server span for the request. The span uses the active async context so Soroban RPC attempt spans are attached as children during downstream calls. Tracing remains a no-op when the endpoint is unset.
+
 `requestLogger` never writes sensitive values to logs. The policy is enforced via two exported sets in `src/middleware/requestLogger.ts`:
 
 | Set                     | Members                                                                                                    |
@@ -667,14 +669,51 @@ consumed on first use.
 
 ## JWT Rotation Notes
 
-- Refresh tokens are treated as single-use in rotation flows.
-- Reuse of a consumed refresh token must be handled as a theft signal and rejected.
-- Clock skew is tolerated by verifier configuration; tests should use expirations beyond skew tolerance.
+The rotation-aware token family API in `src/utils/jwt.ts` (the `generateAccessToken`,
+`generateRefreshTokenWithFamily`, `generateTokenPair`, `verifyAccessToken`,
+`verifyRefreshTokenRotationAware`, `refreshTokenPair` family) implements the
+following single-use/rotation contract:
 
-Environment variables used by JWT tests and auth flows:
+- **Single use, by construction**: `refreshTokenPair` consumes the presented
+  refresh-token `jti` (moving it into the family's `blacklistedJtis`) *before*
+  minting a replacement, so a replayed token can never re-rotate.
+- **Reuse = theft**: any replay of a consumed refresh token raises `TOKEN_REUSED`
+  and revokes the WHOLE family — the sibling access token and the current
+  refresh token are added to the global blacklist immediately, and the family is
+  marked `concurrentRefreshDetected` (persistent compromise marker). Freshly
+  minted tokens for that family are then rejected with `FAMILY_COMPROMISED`.
+  This response is asserted end-to-end in `tests/security/jwt-reuse-detection.spec.ts`.
+- **Concurrent refresh is serialised** per family with an async mutex
+  (`withFamilyLock`), so two requests presenting the same refresh token cannot
+  both succeed: exactly one rotation wins, the peers are rejected as reusers.
+  Covered by `tests/unit/utils/jwt.test.ts` ("serialises concurrent refresh...").
+- **Claim binding**: family tokens embed `jti`, `familyId`, and a `type` claim
+  plus distinct audiences (`JWT_AUDIENCE` for access, `JWT_REFRESH_AUDIENCE` for
+  refresh). Verification enforces `iss`, the correct `aud` for the token role,
+  and `alg: HS256`, so access tokens can never be redeemed as refresh tokens and
+  vice-versa (algorithm-confusion is blocked).
+- **Clock skew** is tolerated by verifier configuration; tests should use
+  expirations beyond skew tolerance.
 
+### In-memory scope caveat
+
+The family store is process-local. Multi-instance deployments must use the
+durable `usedTokenStore` replay detection (`src/services/auth/usedTokenStore.js`),
+which already backs the deployed `/auth/refresh` route.
+
+### Async `refreshTokenPair` migration note
+
+`refreshTokenPair` is **async** (per-family mutex). There are no in-repo callers
+yet; callers awaiting a synchronous return must `await` it.
+
+### Environment variables used by JWT tests and auth flows
+
+- `JWT_ISSUER` (default `veritasor-api`)
+- `JWT_AUDIENCE` (default `veritasor-client`) — access token audience
+- `JWT_REFRESH_AUDIENCE` (default `veritasor-refresh`) — refresh token audience
 - `JWT_SECRET` (access token secret)
-- `JWT_REFRESH_SECRET` (refresh token secret)
+- `JWT_REFRESH_SECRET` (refresh token secret — falls back to the primary secret
+  in production with a logged warning)
 - `JWT_CLOCK_SKEW_SECONDS` (default `10`)
 - `JWT_ACCESS_TOKEN_TTL` (default `3600`)
 - `JWT_REFRESH_TOKEN_TTL` (default `604800`)
@@ -688,6 +727,72 @@ Environment variables used by JWT tests and auth flows:
 ## Razorpay Webhook Integration Tests
 
 `tests/integration/razorpay-webhook.test.ts` posts JSON webhook payloads through the mounted Express app and computes the Razorpay HMAC over the same raw UTF-8 bytes sent to the route. Coverage includes valid signed events, tampered payloads, missing signatures, missing `RAZORPAY_WEBHOOK_SECRET`, empty bodies, and replayed event IDs.
+
+---
+
+## Attestation Lifecycle Integration Test (Real Postgres)
+
+**Location**: `tests/integration/attestation-lifecycle.test.ts`
+
+### Overview
+
+This is the only test in the suite that drives the full attestation lifecycle through a **real PostgreSQL database** using a Docker-based Postgres container (via `testcontainers`). It exercises:
+
+- The **UNIQUE (business_id, period) constraint** — duplicate submission rejected
+- **Database-layer status transitions** — submitted → revoked
+- **Real migration execution** — runs `src/db/migrate.ts` against the container
+- **Audit log writes** — verifies entries are created for submit and revoke actions
+- **Merkle proof generation** — self-verify proofs against the stored root
+
+### Flow
+
+1. **Spin up** a Postgres 16 Alpine container on a random host port
+2. **Run migrations** against the container via `npx tsx src/db/migrate.ts`
+3. **Seed** a user + business in the in-memory store (business routes use the in-memory store)
+4. **POST** `/api/attestations` — creates an attestation (exercises real Postgres `attestationRepository`)
+5. **POST** duplicate — verifies the UNIQUE constraint returns >= 400
+6. **GET** `/api/attestations` — lists attestations against real DB
+7. **GET** `/api/attestations/:id` — fetches a single attestation
+8. **GET** `/api/attestations/:id/proof` — generates and self-verifies a Merkle proof
+9. **POST** `/api/attestations/:id/revoke` — transitions status to `revoked`
+10. **POST** double-revoke — verifies `ALREADY_REVOKED` error
+11. **GET** `/api/attestations?status=submitted` — filtered listing
+12. **Audit log assertions** — verifies audit entries for submit/revoke
+13. **DB assertions** — checks row version, timestamps, and UNIQUE constraint
+14. **DELETE** `/api/attestations/:id/revoke` — alternative revoke method
+
+### Docker Availability
+
+The suite calls `isDockerAvailable()` at module load time using `docker info`. If Docker is not installed or the daemon is not running, the entire test file is **skipped gracefully** with a named `describe.skip` block:
+
+```
+↓ Attestation lifecycle (real Postgres) — Docker unavailable (1) [skipped]
+```
+
+### Running
+
+```bash
+# Run only the lifecycle test
+npx vitest run tests/integration/attestation-lifecycle.test.ts
+
+# Run all integration tests (skips lifecycle if Docker unavailable)
+npx vitest run tests/integration/
+```
+
+### Sequential Test Dependency
+
+Tests within the file are **order-dependent** — they share container state and a single attestation ID persisted via `globalThis.__lc_attId`. Do not run individual `it()` calls in isolation.
+
+### Threat Model Notes
+
+| Vector | Mitigation |
+|--------|-----------|
+| **Docker unavailable** | Suite skipped gracefully — no hard failure |
+| **Container start failure** | `beforeAll` throws a clear error pointing to Docker/container issue |
+| **Migration failure** | `execSync` throws with `DATABASE_URL` context in the error message |
+| **Parallel suite isolation** | Each run uses a unique `RUN_ID` prefix for idempotency keys; a fresh container is started per process |
+
+---
 
 ## End-to-End (E2E) Testing Plan
 

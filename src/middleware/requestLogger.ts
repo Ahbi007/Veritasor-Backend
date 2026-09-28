@@ -1,7 +1,9 @@
 import { Request, Response, NextFunction } from "express";
 import { logger, runWithLoggerContext } from "../utils/logger.js";
 import { randomUUID } from "crypto";
-import { httpRequestDuration } from "../metrics.js";
+import { context, propagation } from "@opentelemetry/api";
+import { observeHttpRequestDuration } from "../metrics.js";
+import { startHttpRequestSpan } from "../tracing.js";
 
 /**
  * Extended Express Request with correlation ID for request tracing.
@@ -57,7 +59,9 @@ export function sanitizeCorrelationId(value: unknown): string | undefined {
 function redactQuery(query: Record<string, unknown>): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(query)) {
-    result[key] = REDACTED_QUERY_PARAMS.has(key.toLowerCase()) ? REDACTED : value;
+    result[key] = REDACTED_QUERY_PARAMS.has(key.toLowerCase())
+      ? REDACTED
+      : value;
   }
   return result;
 }
@@ -97,35 +101,51 @@ export function requestLogger(req: Request, res: Response, next: NextFunction) {
   res.setHeader("X-Request-ID", correlationId);
 
   return runWithLoggerContext({ correlationId }, () => {
-    logger.info({
-      type: "request",
-      method: req.method,
-      path: req.path,
-      query: redactQuery(req.query as Record<string, unknown>),
-      ip: req.ip,
-      userAgent: req.headers["user-agent"],
-    });
+    startHttpRequestSpan(
+      req,
+      res,
+      correlationId,
+      () => {
+        const activeBaggage = propagation.getBaggage(context.active());
+        const tenantId = activeBaggage?.getEntry("tenant.id")?.value;
 
-    res.on("finish", () => {
-      const [sec, nano] = process.hrtime(start);
-      const durationMs = sec * 1e3 + nano / 1e6;
-      const durationSec = sec + nano / 1e9;
+        logger.info({
+          type: "request",
+          correlationId,
+          tenantId,
+          method: req.method,
+          path: req.path,
+          query: redactQuery(req.query as Record<string, unknown>),
+          ip: req.ip,
+          userAgent: req.headers["user-agent"],
+        });
 
-      const route = (req.route?.path as string | undefined) ?? req.path;
-      httpRequestDuration.observe(
-        { method: req.method, route, status_code: String(res.statusCode) },
-        durationSec,
-      );
+        next();
+      },
+      () => {
+        const [sec, nano] = process.hrtime(start);
+        const durationMs = sec * 1e3 + nano / 1e6;
+        const durationSec = sec + nano / 1e9;
 
-      logger.info({
-        type: "response",
-        method: req.method,
-        path: req.path,
-        statusCode: res.statusCode,
-        durationMs: parseFloat(durationMs.toFixed(3)),
-      });
-    });
+        const route = (req.route?.path as string | undefined) ?? req.path;
+        observeHttpRequestDuration(
+          { method: req.method, route, status_code: String(res.statusCode) },
+          durationSec,
+        );
 
-    next();
+        const activeBaggage = propagation.getBaggage(context.active());
+        const tenantId = activeBaggage?.getEntry("tenant.id")?.value;
+
+        logger.info({
+          type: "response",
+          correlationId,
+          tenantId,
+          method: req.method,
+          path: req.path,
+          statusCode: res.statusCode,
+          durationMs: parseFloat(durationMs.toFixed(3)),
+        });
+      },
+    );
   });
 }

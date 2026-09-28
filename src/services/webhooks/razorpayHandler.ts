@@ -1,7 +1,15 @@
 import crypto from 'node:crypto'
 import { z } from 'zod'
 import { logger } from '../../utils/logger.js'
+import {
+  BackoffError,
+  type BackoffOptions,
+  DEFAULT_BACKOFF_OPTIONS,
+  withBackoff,
+} from '../../utils/backoff.js'
 import { isEventProcessed, markEventProcessed, checkTimestampTolerance } from './idempotency.js'
+import { saveDeadLetter } from './deadLetterQueue.js'
+import { webhookRetryAttempts, webhookRetryExhaustedTotal } from '../../metrics.js'
 
 const HANDLED_EVENT_TYPES = new Set(['payment.captured', 'payment.failed', 'order.paid'])
 const DEFAULT_MAX_FUTURE_SKEW_MS = 5 * 60 * 1000
@@ -80,6 +88,57 @@ export function verifyRazorpaySignature(
   return crypto.timingSafeEqual(expectedSignature, providedSignature)
 }
 
+/**
+ * Result of a rotation-aware signature verification attempt.
+ *
+ * @property valid   - Whether any candidate secret produced a matching signature.
+ * @property keyLabel - Which key matched: `'primary'` | `'secondary'` | `null` when no match.
+ *                      Never contains the secret value itself — safe to log.
+ */
+export interface VerifyWithRotationResult {
+  valid: boolean
+  keyLabel: 'primary' | 'secondary' | null
+}
+
+/**
+ * Verifies a Razorpay webhook signature against one or two candidate secrets,
+ * enabling zero-downtime secret rotation.
+ *
+ * Rotation workflow:
+ *   1. Generate the new secret in Razorpay and set it as `RAZORPAY_WEBHOOK_SECRET_NEXT`.
+ *   2. Deploy — both old (`RAZORPAY_WEBHOOK_SECRET`) and new secrets are accepted.
+ *   3. Once Razorpay has fully switched to the new secret, promote it:
+ *      set `RAZORPAY_WEBHOOK_SECRET=<new>` and unset `RAZORPAY_WEBHOOK_SECRET_NEXT`.
+ *
+ * Security properties:
+ *   - Each candidate is compared with `crypto.timingSafeEqual` to prevent timing attacks.
+ *   - The secondary is only tried when the primary fails, so the common path (primary match)
+ *     does not leak timing information about the secondary secret's existence.
+ *   - `keyLabel` in the return value is a fixed string (`'primary'` / `'secondary'`),
+ *     never the secret itself, so it is safe to include in structured logs.
+ *
+ * @param rawBody   - Raw request body bytes (must be the exact bytes Razorpay signed).
+ * @param signature - Hex-encoded HMAC-SHA256 from the `x-razorpay-signature` header.
+ * @param primary   - Value of `RAZORPAY_WEBHOOK_SECRET` (required).
+ * @param secondary - Value of `RAZORPAY_WEBHOOK_SECRET_NEXT` (optional, for rotation).
+ */
+export function verifyRazorpaySignatureWithRotation(
+  rawBody: Buffer | string,
+  signature: string,
+  primary: string,
+  secondary?: string,
+): VerifyWithRotationResult {
+  if (verifyRazorpaySignature(rawBody, signature, primary)) {
+    return { valid: true, keyLabel: 'primary' }
+  }
+
+  if (secondary && verifyRazorpaySignature(rawBody, signature, secondary)) {
+    return { valid: true, keyLabel: 'secondary' }
+  }
+
+  return { valid: false, keyLabel: null }
+}
+
 export function parseRazorpayEvent(
   rawBody: Buffer | string,
   options?: { nowMs?: number; maxFutureSkewMs?: number },
@@ -119,7 +178,7 @@ export function resetProcessedRazorpayEvents(): void {
   processedEvents.clear()
 }
 
-export function handleRazorpayEvent(event: RazorpayEvent): { status: string; message: string } {
+async function processRazorpayEvent(event: RazorpayEvent): Promise<{ status: string; message: string }> {
   if (processedEvents.has(event.id)) {
     logger.info(
       JSON.stringify({
@@ -181,5 +240,50 @@ export function handleRazorpayEvent(event: RazorpayEvent): { status: string; mes
         status: 'ignored',
         message: `Unhandled event type: ${event.event}`,
       }
+  }
+}
+
+export async function handleRazorpayEvent(
+  event: RazorpayEvent,
+  backoffOptions?: Partial<BackoffOptions>,
+): Promise<{ status: string; message: string }> {
+  const options: BackoffOptions = { ...DEFAULT_BACKOFF_OPTIONS, ...backoffOptions }
+
+  try {
+    return await withBackoff(
+      async () => processRazorpayEvent(event),
+      options,
+      (attempt, delayMs, error) => {
+        webhookRetryAttempts.observe({ provider: 'razorpay' }, attempt)
+        logger.warn(
+          JSON.stringify({
+            type: 'razorpay_webhook_retry',
+            eventId: event.id,
+            eventType: event.event,
+            attempt,
+            delayMs,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        )
+      },
+    )
+  } catch (error) {
+    if (event.id) {
+      webhookRetryExhaustedTotal.inc({ provider: 'razorpay' })
+      const cause = error instanceof BackoffError ? error.cause : error
+      const attemptCount = error instanceof BackoffError ? error.attemptCount : 1
+      try {
+        await saveDeadLetter('razorpay', event.id, event, cause, attemptCount)
+      } catch (dlqError) {
+        logger.error(
+          JSON.stringify({
+            type: 'razorpay_webhook_dlq_failed',
+            eventId: event.id,
+            error: dlqError instanceof Error ? dlqError.message : String(dlqError),
+          }),
+        )
+      }
+    }
+    throw error
   }
 }

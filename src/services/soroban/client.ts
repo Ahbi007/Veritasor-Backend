@@ -1,5 +1,14 @@
 import { Networks, rpc, StrKey } from "@stellar/stellar-sdk";
 import { logger } from "../../utils/logger.js";
+import { config } from "../../config/index.js";
+import {
+  SorobanRetryBudgetExceededError,
+  sorobanRetryBudget,
+  fullJitter,
+  getBackoffConfig,
+  type BackoffConfig,
+} from "./retry-budget.js";
+import { traceSorobanRpcAttempt } from "../../tracing.js";
 
 export type SorobanClientConfig = {
   rpcUrl: string;
@@ -98,6 +107,10 @@ export class SorobanCircuitBreakerError extends Error {
     super(message);
     this.name = "SorobanCircuitBreakerError";
   }
+}
+
+export function isSorobanCircuitBreakerOpen(error: unknown): error is SorobanCircuitBreakerError {
+  return error instanceof SorobanCircuitBreakerError && error.state === CircuitBreakerState.OPEN;
 }
 
 const DEFAULT_RPC_URL = "https://soroban-testnet.stellar.org";
@@ -296,14 +309,24 @@ export function getSorobanRetryPolicy(
       MAX_RETRIES,
     ),
     retryBaseDelayMs: parseIntegerEnv(
-      "SOROBAN_RPC_RETRY_BASE_DELAY_MS",
-      DEFAULT_RETRY_POLICY.retryBaseDelayMs,
+      "SOROBAN_BACKOFF_BASE_MS",
+      parseIntegerEnv(
+        "SOROBAN_RPC_RETRY_BASE_DELAY_MS",
+        DEFAULT_RETRY_POLICY.retryBaseDelayMs,
+        MIN_DELAY_MS,
+        MAX_DELAY_MS,
+      ),
       MIN_DELAY_MS,
       MAX_DELAY_MS,
     ),
     retryMaxDelayMs: parseIntegerEnv(
-      "SOROBAN_RPC_RETRY_MAX_DELAY_MS",
-      DEFAULT_RETRY_POLICY.retryMaxDelayMs,
+      "SOROBAN_BACKOFF_MAX_MS",
+      parseIntegerEnv(
+        "SOROBAN_RPC_RETRY_MAX_DELAY_MS",
+        DEFAULT_RETRY_POLICY.retryMaxDelayMs,
+        MIN_DELAY_MS,
+        MAX_DELAY_MS,
+      ),
       MIN_DELAY_MS,
       MAX_DELAY_MS,
     ),
@@ -347,24 +370,34 @@ function sleep(delayMs: number): Promise<void> {
   });
 }
 
+/**
+ * Calculates exponential backoff delay with full jitter for retry attempts.
+ *
+ * Uses the full jitter algorithm to prevent thundering herd:
+ * each retrying client picks a uniformly random delay in [0, cap]
+ * where cap = min(retryMaxDelayMs, retryBaseDelayMs * 2^attempt).
+ *
+ * This delegates to the fullJitter() function from retry-budget.ts
+ * which implements the AWS Exponential Backoff algorithm.
+ *
+ * @param attemptNumber - 1-based retry attempt number (1 = first retry)
+ * @param policy - retry policy containing base and max delays
+ * @param random - PRNG returning values in [0, 1) for testability
+ * @returns Delay in milliseconds before the next retry
+ */
 function calculateRetryDelay(
   attemptNumber: number,
   policy: SorobanRetryPolicy,
   random: RandomFn,
 ): number {
-  const exponentialDelay = Math.min(
-    policy.retryBaseDelayMs * 2 ** (attemptNumber - 1),
+  // Convert from 1-based attempt to 0-based for fullJitter
+  const zeroBasedAttempt = attemptNumber - 1;
+  return fullJitter(
+    zeroBasedAttempt,
+    policy.retryBaseDelayMs,
     policy.retryMaxDelayMs,
+    random,
   );
-
-  if (policy.retryJitterRatio === 0) {
-    return exponentialDelay;
-  }
-
-  const jitterWindow = exponentialDelay * policy.retryJitterRatio;
-  const jitterOffset = (random() * 2 - 1) * jitterWindow;
-  const delayWithJitter = Math.round(exponentialDelay + jitterOffset);
-  return Math.max(MIN_DELAY_MS, delayWithJitter);
 }
 
 function isAbortError(error: unknown): boolean {
@@ -516,10 +549,15 @@ export async function executeSorobanRequest<T>(
     hooks?.onRequestStart?.(options.operationName, attempt);
 
     try {
-      const result = await withSorobanTimeout(
+      const result = await traceSorobanRpcAttempt(
         options.operationName,
-        policy.timeoutMs,
-        options.execute,
+        attempt,
+        () =>
+          withSorobanTimeout(
+            options.operationName,
+            policy.timeoutMs,
+            options.execute,
+          ),
       );
 
       const duration = Date.now() - startTime;
@@ -533,6 +571,16 @@ export async function executeSorobanRequest<T>(
       if (!shouldRetry) {
         return result;
       }
+
+      if (!sorobanRetryBudget.canRetry()) {
+        const currentRetryCount = sorobanRetryBudget.getRetryCount();
+        throw new SorobanRetryBudgetExceededError(
+          currentRetryCount,
+          config.soroban.retryBudgetMaxRetries,
+        );
+      }
+
+      sorobanRetryBudget.recordRetry(options.operationName);
 
       const delayMs = calculateRetryDelay(attempt, policy, random);
       hooks?.onRetry?.(options.operationName, attempt, delayMs, null);
@@ -558,6 +606,16 @@ export async function executeSorobanRequest<T>(
         hooks?.onRequestFailure?.(options.operationName, attempt, duration, error);
         throw error;
       }
+
+      if (!sorobanRetryBudget.canRetry()) {
+        const currentRetryCount = sorobanRetryBudget.getRetryCount();
+        throw new SorobanRetryBudgetExceededError(
+          currentRetryCount,
+          config.soroban.retryBudgetMaxRetries,
+        );
+      }
+
+      sorobanRetryBudget.recordRetry(options.operationName);
 
       const delayMs = calculateRetryDelay(attempt, policy, random);
       hooks?.onRetry?.(options.operationName, attempt, delayMs, error);

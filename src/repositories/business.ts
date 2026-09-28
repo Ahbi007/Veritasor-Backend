@@ -1,4 +1,7 @@
 import crypto from 'crypto'
+import { decodeCursor, encodeCursor } from '../utils/pagination.js'
+
+export type ReportingPeriod = 'weekly' | 'monthly'
 
 export interface Business {
   id: string
@@ -8,6 +11,12 @@ export interface Business {
   industry?: string | null
   description?: string | null
   website?: string | null
+  /** Calendar granularity for attestation reminder alignment. Defaults to 'monthly'. */
+  reportingPeriod: ReportingPeriod
+  /** IANA timezone for computing period boundaries, e.g. 'America/New_York'. Defaults to 'UTC'. */
+  reportingTimezone: string
+  /** ISO-8601 timestamp of the last time a reminder was sent. Null if never sent. */
+  lastReminderSentAt: string | null
   createdAt: string
   updatedAt: string
 }
@@ -19,6 +28,8 @@ export type CreateBusinessData = {
   industry?: string | null
   description?: string | null
   website?: string | null
+  reportingPeriod?: ReportingPeriod
+  reportingTimezone?: string
 }
 
 export type UpdateBusinessData = Partial<Omit<CreateBusinessData, 'userId'>>
@@ -36,6 +47,9 @@ export async function create(data: CreateBusinessData): Promise<Business> {
     industry: data.industry ?? null,
     description: data.description ?? null,
     website: data.website ?? null,
+    reportingPeriod: data.reportingPeriod ?? 'monthly',
+    reportingTimezone: data.reportingTimezone ?? 'UTC',
+    lastReminderSentAt: null,
     createdAt: now,
     updatedAt: now,
   }
@@ -47,6 +61,13 @@ export async function create(data: CreateBusinessData): Promise<Business> {
 export async function getById(id: string): Promise<Business | null> {
   const business = businesses.get(id)
   return business ? { ...business } : null
+}
+
+export async function getByIds(ids: readonly string[]): Promise<(Business | Error)[]> {
+  return ids.map(id => {
+    const business = businesses.get(id)
+    return business ? { ...business } : new Error(`Business not found: ${id}`)
+  })
 }
 
 export async function getByUserId(userId: string): Promise<Business | null> {
@@ -90,17 +111,13 @@ export async function list(options: BusinessListOptions): Promise<PaginatedBusin
   }
   
   if (cursor) {
-    try {
-      const decoded = JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8'));
-      if (decoded.value !== undefined && decoded.id !== undefined) {
-        values.push(decoded.value);
-        values.push(decoded.id);
-        const valIdx = values.length - 1;
-        const idIdx = values.length;
-        conditions.push(`(${sortColumn}, id) ${op} ($${valIdx}, $${idIdx})`);
-      }
-    } catch (e) {
-      // Ignore invalid cursor
+    const decoded = decodeCursor(cursor)
+    if (decoded) {
+      values.push(decoded.value)
+      values.push(decoded.id)
+      const valIdx = values.length - 1
+      const idIdx = values.length
+      conditions.push(`(${sortColumn}, id) ${op} ($${valIdx}, $${idIdx})`)
     }
   }
   
@@ -110,7 +127,7 @@ export async function list(options: BusinessListOptions): Promise<PaginatedBusin
   values.push(limit + 1);
   const limitIdx = values.length;
   
-  const result = await dbClient.query<BusinessRow>(
+  const result = await dbClient.query(
     `
       SELECT id, user_id, name, email, industry, description, website, created_at, updated_at
       FROM businesses
@@ -122,14 +139,14 @@ export async function list(options: BusinessListOptions): Promise<PaginatedBusin
   );
   
   const hasMore = result.rows.length > limit;
-  const rowsToReturn = hasMore ? result.rows.slice(0, limit) : result.rows;
+  const rowsToReturn = hasMore ? (result.rows as BusinessRow[]).slice(0, limit) : (result.rows as BusinessRow[]);
   const items = rowsToReturn.map(toBusiness);
   
   let nextCursor: string | undefined;
   if (hasMore) {
-    const lastItem = items[items.length - 1];
-    const sortValue = sortBy === 'createdAt' ? lastItem.createdAt : lastItem.name;
-    nextCursor = Buffer.from(JSON.stringify({ value: sortValue, id: lastItem.id })).toString('base64');
+    const lastItem = items[items.length - 1]
+    const sortValue = sortBy === 'createdAt' ? lastItem.createdAt : lastItem.name
+    nextCursor = encodeCursor({ value: sortValue, id: lastItem.id })
   }
   
   return { items, nextCursor };
@@ -155,13 +172,27 @@ export function clearAll(): void {
   businesses.clear()
 }
 
+/**
+ * Persist the last reminder sent timestamp for a business.
+ * Returns false if the business was not found.
+ */
+export async function setLastReminderSentAt(id: string, sentAt: string): Promise<boolean> {
+  const business = businesses.get(id)
+  if (!business) return false
+  business.lastReminderSentAt = sentAt
+  business.updatedAt = new Date().toISOString()
+  return true
+}
+
 export const businessRepository = {
   create,
   getById,
+  getByIds,
   getByUserId,
   getAll,
   list,
   update,
+  setLastReminderSentAt,
   findById: getById,
   findByUserId: getByUserId,
   clearAll,

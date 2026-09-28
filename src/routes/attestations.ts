@@ -7,6 +7,7 @@ import { validateBody, validateQuery } from '../middleware/validate.js';
 import * as attestationRepository from '../repositories/attestationRepository.js';
 import { businessRepository } from '../repositories/business.js';
 import { db } from '../db/client.js';
+import { createAuditLog } from '../repositories/auditLogRepository.js';
 import { ReadConsistency, type Attestation } from '../types/attestation.js';
 import { revokeAttestation as revokeAttestationService } from '../services/attestation/revoke.js';
 import type {
@@ -19,10 +20,16 @@ import {
   type AttestationRevenueSummary,
   type RawRevenueInput,
 } from '../services/attestation/integrateRevenueChecks.js';
+import {
+  enqueueQueuedAttestation,
+  isSorobanQueueEnabled,
+} from '../services/soroban/submitAttestation.js';
 import { AppError } from '../types/errors.js';
 import { getPagination, formatPaginatedResponse } from '../utils/pagination.js';
 import { generateProof, verifyProof } from '../services/merkle/generateProof.js';
 import { rateLimiter } from '../middleware/rateLimiter.js';
+import { broadcaster } from '../ws/attestationStream.js';
+import { observeAttestationSubmitLatency } from '../metrics.js';
 
 type RouteAttestation = {
   id: string;
@@ -33,11 +40,14 @@ type RouteAttestation = {
   timestamp?: number;
   version?: string;
   txHash?: string;
-  status?: 'submitted' | 'revoked';
+  status?: 'submitted' | 'revoked' | 'queued';
   revokedAt?: string | null;
 };
 
-type SubmitAttestationParams = Omit<SorobanSubmitAttestationParams, 'sourcePublicKey' | 'signerSecret'>;
+type SubmitAttestationParams = Omit<SorobanSubmitAttestationParams, 'sourcePublicKey' | 'signerSecret'> & {
+  userId?: string;
+  businessId?: string;
+};
 
 type SubmitAttestationResult = SorobanSubmitAttestationResult;
 
@@ -268,45 +278,52 @@ async function revokeAttestation(id: string, reason?: string): Promise<RouteAtte
   };
 }
 
-async function submitOnChain(params: SubmitAttestationParams): Promise<SubmitAttestationResult> {
-  const shouldSubmit = params.submit ?? true;
-  const submissionEnabled = process.env.SOROBAN_SUBMIT_ENABLED === 'true';
-
-  if (shouldSubmit && !submissionEnabled) {
-    return { txHash: `pending_${randomUUID()}`, status: 'pending' };
-  }
-
-  const sourcePublicKey = process.env.SOROBAN_SOURCE_PUBLIC_KEY;
-  if (!sourcePublicKey) {
-    throw createHttpError(503, 'SOROBAN_NOT_CONFIGURED', 'Soroban submission is not available right now.');
-  }
-
-  const modulePath = '../services/soroban/submitAttestation.js';
-  let module: {
-    submitAttestation?: (value: SorobanSubmitAttestationParams) => Promise<SorobanSubmitAttestationResult>;
-  };
-
+async function submitOnChain(
+  params: SubmitAttestationParams & { userId?: string; businessId?: string },
+): Promise<SubmitAttestationResult> {
+  const startTime = process.hrtime.bigint();
+  let statusForMetric = 'success';
   try {
-    module = (await import(modulePath)) as typeof module;
-  } catch (_error) {
-    return { txHash: `pending_${randomUUID()}`, status: 'pending' };
-  }
+    const shouldSubmit = params.submit ?? true;
+    const submissionEnabled = process.env.SOROBAN_SUBMIT_ENABLED === 'true';
 
-  if (typeof module.submitAttestation !== 'function') {
-    return { txHash: `pending_${randomUUID()}`, status: 'pending' };
-  }
+    if (shouldSubmit && !submissionEnabled) {
+      return { txHash: `pending_${randomUUID()}`, status: 'pending' };
+    }
 
-  try {
+    const sourcePublicKey = process.env.SOROBAN_SOURCE_PUBLIC_KEY;
+    if (!sourcePublicKey) {
+      throw createHttpError(503, 'SOROBAN_NOT_CONFIGURED', 'Soroban submission is not available right now.');
+    }
+
+    const modulePath = '../services/soroban/submitAttestation.js';
+    let module: {
+      submitAttestation?: (value: SorobanSubmitAttestationParams) => Promise<SorobanSubmitAttestationResult>;
+    };
+
+    try {
+      module = (await import(modulePath)) as typeof module;
+    } catch (_error) {
+      return { txHash: `pending_${randomUUID()}`, status: 'pending' };
+    }
+
+    if (typeof module.submitAttestation !== 'function') {
+      return { txHash: `pending_${randomUUID()}`, status: 'pending' };
+    }
+
     return await module.submitAttestation({ ...params, sourcePublicKey, submit: shouldSubmit });
   } catch (error) {
+    statusForMetric = 'error';
     const sorobanError = error as SorobanServiceError;
     const code = sorobanError?.code;
 
     if (code === 'VALIDATION_ERROR') {
+      statusForMetric = 'rejected';
       throw createHttpError(400, code, sorobanError.message);
     }
 
     if (code === 'MISSING_SIGNER' || code === 'SIGNER_MISMATCH') {
+      statusForMetric = 'rejected';
       throw createHttpError(503, code, 'Soroban submission is not available right now.');
     }
 
@@ -318,10 +335,56 @@ async function submitOnChain(params: SubmitAttestationParams): Promise<SubmitAtt
       code === 'RESULT_VALIDATION_FAILED' ||
       code === 'RESULT_MISMATCH'
     ) {
+      if (params.userId && params.businessId) {
+        await createAuditLog({
+          userId: params.userId,
+          action: 'ATTESTATION_SUBMIT_FAILED',
+          resource: 'attestation',
+          resourceId: params.businessId,
+          metadata: {
+            outcome: 'submit_failed',
+            errorCode: code,
+            params: {
+              business: params.business,
+              period: params.period,
+              merkleRoot: params.merkleRoot,
+              timestamp: params.timestamp,
+              version: params.version,
+            },
+          },
+        }).catch(() => {});
+      }
       throw createHttpError(502, code, 'Soroban RPC request failed after applying the retry policy.');
     }
 
+    if (code === 'SOROBAN_CIRCUIT_BREAKER_OPEN' || error instanceof Error && error.name === 'SorobanCircuitBreakerError') {
+      if (isSorobanQueueEnabled()) {
+        const queued = enqueueQueuedAttestation({
+          business: params.business,
+          period: params.period,
+          merkleRoot: params.merkleRoot,
+          timestamp: params.timestamp,
+          version: params.version,
+          submit: params.submit ?? true,
+          userId: params.userId,
+        }, { idempotencyKey: params.userId ? `${params.business}:${params.period}:${params.userId}` : undefined });
+
+        if (queued.queued && queued.item) {
+          return {
+            txHash: `queued_${randomUUID()}`,
+            status: 'queued',
+            unsignedXdr: undefined,
+          };
+        }
+      }
+
+      throw createHttpError(503, 'SOROBAN_DEGRADED', 'Soroban is temporarily degraded; the attestation is queued for retry.');
+    }
+
     throw error;
+  } finally {
+    const durationSec = Number(process.hrtime.bigint() - startTime) / 1e9;
+    observeAttestationSubmitLatency(statusForMetric, durationSec);
   }
 }
 
@@ -496,6 +559,8 @@ attestationsRouter.post(
       timestamp: payload.timestamp ?? Date.now(),
       version: payload.version,
       submit: payload.submit,
+      userId: req.user!.id,
+      businessId,
     });
 
     const submission = {
@@ -506,6 +571,26 @@ attestationsRouter.post(
       ...(onChain.resultMerkleRoot ? { resultMerkleRoot: onChain.resultMerkleRoot } : {}),
       ...(onChain.resultTimestamp !== undefined ? { resultTimestamp: onChain.resultTimestamp } : {}),
     };
+
+    if (onChain.status === 'queued') {
+      res.status(202).json({
+        status: 'success',
+        data: {
+          businessId,
+          period: payload.period,
+          merkleRoot: merkleRoot!,
+          timestamp: payload.timestamp ?? Date.now(),
+          version: payload.version,
+          txHash: onChain.txHash,
+          status: 'queued',
+          attestedAt: new Date().toISOString(),
+          revokedAt: null,
+        },
+        txHash: onChain.txHash,
+        submission,
+      });
+      return;
+    }
 
     const now = new Date().toISOString();
     const record: Omit<RouteAttestation, 'id' | 'attestedAt' | 'revokedAt'> = {
@@ -519,6 +604,15 @@ attestationsRouter.post(
     };
 
     const saved = await saveAttestation(record);
+
+    broadcaster.publish({
+      type: 'attestation.submitted',
+      businessId,
+      attestationId: saved.id,
+      period: saved.period,
+      txHash: onChain.txHash,
+      timestamp: new Date().toISOString(),
+    });
 
     res.status(201).json({
       status: 'success',

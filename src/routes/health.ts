@@ -17,6 +17,7 @@
  */
 import { Router, Request, Response } from "express";
 import { z } from "zod";
+import { checkDatabase } from "../startup/readiness.js";
 
 /**
  * Stable JSON schema for health check response.
@@ -33,6 +34,7 @@ export const HealthResponseSchema = z.object({
   redis: HealthDependencyStatusSchema.optional(),
   soroban: HealthDependencyStatusSchema.optional(),
   email: HealthDependencyStatusSchema.optional(),
+  dependencies: z.record(HealthDependencyStatusSchema).optional(),
 });
 
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
@@ -55,31 +57,13 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 }
 
 /**
- * Check database connectivity by executing a simple SELECT 1 query.
+ * Check database connectivity using the shared pool probe from readiness.
  * @returns Promise resolving to 'ok', 'down', or undefined if DATABASE_URL not set
  */
 async function checkDb(): Promise<"ok" | "down" | undefined> {
-  const url = process.env.DATABASE_URL;
-  if (!url) return undefined;
-  try {
-    const { default: pg } = await import("pg");
-    const client = new pg.Client({ connectionString: url });
-    await withTimeout(
-      (async () => {
-        await client.connect();
-        try {
-          await client.query("SELECT 1");
-          return;
-        } finally {
-          await client.end();
-        }
-      })(),
-      PING_TIMEOUT_MS,
-    );
-    return "ok";
-  } catch {
-    return "down";
-  }
+  if (!process.env.DATABASE_URL) return undefined;
+  const result = await checkDatabase();
+  return result.ready ? "ok" : "down";
 }
 
 /**
@@ -197,9 +181,53 @@ interface HealthResponseBody {
   redis?: "ok" | "down";
   soroban?: "ok" | "down";
   email?: "ok" | "down";
+  dependencies?: Record<string, "ok" | "down">;
 }
 
 export const healthRouter = Router();
+
+/**
+ * GET /health/live
+ *
+ * Liveness check for container orchestrators.
+ * This endpoint intentionally avoids dependency checks so transient database,
+ * Redis, or upstream outages do not cause the container to be restarted.
+ *
+ * @security - No authentication required; no sensitive data exposed
+ * @response 200 - Process is running and able to serve HTTP
+ */
+healthRouter.get("/live", (_req: Request, res: Response) => {
+  res.status(200).json({
+    status: "ok",
+    service: "veritasor-backend",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/**
+ * GET /health/ready
+ *
+ * Readiness check for load balancers and rollout controllers.
+ * Uses the same bounded database probe as startup readiness. When no
+ * DATABASE_URL is configured, the process is considered ready because there
+ * is no database dependency to validate in that environment.
+ *
+ * @security - No authentication required; failure reasons are sanitized
+ * @response 200 - Required dependencies are ready
+ * @response 503 - Required dependencies are unavailable
+ */
+healthRouter.get("/ready", async (_req: Request, res: Response) => {
+  const db = await checkDb();
+  const ready = db !== "down";
+
+  res.status(ready ? 200 : 503).json({
+    status: ready ? "ok" : "unhealthy",
+    service: "veritasor-backend",
+    timestamp: new Date().toISOString(),
+    db,
+    dependencies: db ? { database: db } : undefined,
+  });
+});
 
 /**
  * GET /health
@@ -266,6 +294,16 @@ healthRouter.get("/", async (req: Request, res: Response) => {
     if (soroban !== undefined) body.soroban = soroban;
     if (email !== undefined) body.email = email;
   }
+
+  // Build dependencies block from all checked services
+  const deps: Record<string, "ok" | "down"> = {};
+  if (db !== undefined) deps.database = db;
+  if (redis !== undefined) deps.redis = redis;
+  if (isDeepMode) {
+    if (soroban !== undefined) deps.soroban = soroban;
+    if (email !== undefined) deps.email = email;
+  }
+  if (Object.keys(deps).length > 0) body.dependencies = deps;
 
   res.status(statusCode).json(body);
 });
