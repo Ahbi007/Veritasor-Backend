@@ -1,4 +1,6 @@
 import crypto from "crypto";
+import * as https from "https";
+import { secretLoader } from "../../utils/secret-loader.js";
 import { staleWebhookDeliveries } from "../../metrics.js";
 import { createAuditLog } from "../../repositories/auditLogRepository.js";
 import { createDeliveryReceipt } from "../../repositories/deliveryReceiptRepository.js";
@@ -12,6 +14,12 @@ export class WebhookPayloadTooLargeError extends Error {
   }
 }
 
+export interface WebhookMTLSConfig {
+  clientCertSecretId: string;
+  clientKeySecretId: string;
+  caPinSecretId: string;
+}
+
 export interface WebhookSubscription {
   id: string;
   businessId: string;
@@ -20,6 +28,9 @@ export interface WebhookSubscription {
   maxPayloadSize?: number;
   /** Monotonically increasing version of the webhook secret, used for rotation tracking. */
   secretVersion?: number;
+  /** Per-event filter DSL. Maps event types to boolean or filter objects. */
+  eventFilters?: Record<string, boolean | Record<string, string>>;
+  mtlsConfig?: WebhookMTLSConfig | null;
 }
 
 export interface WebhookDeliveryReceipt {
@@ -39,7 +50,7 @@ export function signAndPrepareDelivery(
 ): { headers: Record<string, string>; receipt: WebhookDeliveryReceipt } {
   const serializedPayload = JSON.stringify(payload);
   
-  if (subscription.maxPayloadSize !== undefined) {
+  if (subscription.maxPayloadSize !== undefined && subscription.maxPayloadSize !== null) {
     const payloadSize = Buffer.byteLength(serializedPayload, 'utf8');
     if (payloadSize > subscription.maxPayloadSize) {
       createAuditLog({
@@ -179,6 +190,73 @@ export interface SendWebhookDeliveryResult {
   responseBody?: string;
 }
 
+/**
+ * Evaluate whether an event should be delivered to a subscription
+ * based on its event-filters DSL.
+ *
+ * When no filters are configured, all events are delivered.
+ * Otherwise the first matching rule (exact → segment wildcard → recursive)
+ * determines delivery.
+ */
+export function shouldDeliverEvent(
+  eventType: string,
+  eventPayload: Record<string, unknown>,
+  subscription: WebhookSubscription,
+): boolean {
+  const filters = subscription.eventFilters;
+  if (!filters || Object.keys(filters).length === 0) return true;
+
+  // 1. Exact match
+  const exact = filters[eventType];
+  if (typeof exact === "boolean") return exact;
+  if (typeof exact === "object" && exact !== null) {
+    return objectFilterMatches(exact, eventPayload);
+  }
+
+  // 2. Segment-level wildcard
+  const segments = eventType.split(".");
+  for (let i = 0; i < segments.length; i++) {
+    const pattern = [...segments.slice(0, i), "*"].join(".");
+    const match = filters[pattern];
+    if (typeof match === "boolean") return match;
+    if (typeof match === "object" && match !== null) {
+      return objectFilterMatches(match, eventPayload);
+    }
+  }
+
+  // 3. Recursive wildcard
+  const recursive = filters["**"];
+  if (typeof recursive === "boolean") return recursive;
+  if (typeof recursive === "object" && recursive !== null) {
+    return objectFilterMatches(recursive, eventPayload);
+  }
+
+  return true;
+}
+
+function objectFilterMatches(
+  filter: Record<string, string>,
+  payload: Record<string, unknown>,
+): boolean {
+  for (const [key, expectedValue] of Object.entries(filter)) {
+    const actualValue = resolveDotPath(payload, key);
+    if (actualValue === undefined) return false;
+    if (String(actualValue) !== expectedValue) return false;
+  }
+  return true;
+}
+
+function resolveDotPath(obj: Record<string, unknown>, path: string): unknown {
+  const parts = path.split(".");
+  let current: unknown = obj;
+  for (const part of parts) {
+    if (current === null || current === undefined) return undefined;
+    if (typeof current !== "object") return undefined;
+    current = (current as Record<string, unknown>)[part];
+  }
+  return current;
+}
+
 export async function sendWebhookDelivery(options: SendWebhookDeliveryOptions): Promise<SendWebhookDeliveryResult> {
   const { subscription, payload, attempt = 1 } = options;
 
@@ -186,6 +264,44 @@ export async function sendWebhookDelivery(options: SendWebhookDeliveryOptions): 
 
   const url = subscription.url;
   const serializedPayload = JSON.stringify(payload);
+  
+  let agent: https.Agent | undefined;
+
+  if (subscription.mtlsConfig) {
+    const [clientCert, clientKey, caPin] = await Promise.all([
+      secretLoader.get(subscription.mtlsConfig.clientCertSecretId),
+      secretLoader.get(subscription.mtlsConfig.clientKeySecretId),
+      secretLoader.get(subscription.mtlsConfig.caPinSecretId),
+    ]);
+
+    const cert = new crypto.X509Certificate(clientCert);
+    const now = new Date();
+    const validTo = new Date(cert.validTo);
+
+    if (now > validTo) {
+      createAuditLog({
+        userId: subscription.businessId,
+        action: 'webhook_delivery_rejected',
+        resource: 'webhook_subscription',
+        resourceId: subscription.id,
+        metadata: {
+          reason: 'MTLS_CERT_EXPIRED',
+          validTo: validTo.toISOString(),
+        }
+      }).catch(err => console.error('Failed to write audit log', err));
+
+      throw new Error(`Client certificate for subscription ${subscription.id} expired on ${validTo.toISOString()}`);
+    }
+
+    agent = new https.Agent({
+      cert: clientCert,
+      key: clientKey,
+      ca: caPin,
+      rejectUnauthorized: true,
+      keepAlive: true,
+    });
+  }
+
   const startedAt = Date.now();
 
   let statusCode = 0;
@@ -199,14 +315,16 @@ export async function sendWebhookDelivery(options: SendWebhookDeliveryOptions): 
         "Content-Type": "application/json",
       },
       body: serializedPayload,
+      agent,
     });
 
     statusCode = response.status;
 
     const text = await response.text();
     responseBody = text.length > 2048 ? text.slice(0, 2048) : text;
-  } catch {
+  } catch (error) {
     statusCode = 0;
+    responseBody = error instanceof Error ? error.message : "Unknown networking error";
   }
 
   const latencyMs = Date.now() - startedAt;

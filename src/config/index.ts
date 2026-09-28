@@ -63,6 +63,11 @@ export const envSchema = z.object({
   STATSD_PREFIX: z.string().optional(),
   STATSD_DUAL_WRITE_ENABLED: z.string().optional(),
   STATSD_DUAL_WRITE_INTERVAL_MS: z.string().optional(),
+  OTEL_EXPORTER_PROTOCOL: z.enum(["http", "grpc"]).default("http"),
+  OTEL_GRPC_MTLS_ENABLED: z.string().optional(),
+  OTEL_MTLS_CA_PATH: z.string().optional(),
+  OTEL_MTLS_CERT_PATH: z.string().optional(),
+  OTEL_MTLS_KEY_PATH: z.string().optional(),
 }).superRefine((data, ctx) => {
   if (data.NODE_ENV === "production") {
       if (!data.ALLOWED_ORIGINS || data.ALLOWED_ORIGINS.trim() === "") {
@@ -197,6 +202,11 @@ export function getAllowedOrigins(): string | string[] {
   return "*";
 }
 
+function parseCsvList(rawValue: string | undefined): string[] {
+  if (!rawValue) return [];
+  return rawValue.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
 function parseMtlsConfig(parsedEnv: z.infer<typeof envSchema>) {
   const enabled = parseBooleanEnv("MTLS_ENABLED", parsedEnv.MTLS_ENABLED, false);
   const spiffeEnabled = parseBooleanEnv(
@@ -263,6 +273,17 @@ export const config = {
         }
       : undefined,
   },
+  otel: {
+    exporterProtocol: parsedEnv.OTEL_EXPORTER_PROTOCOL,
+    grpc: {
+      mtls: {
+        enabled: parseBooleanEnv("OTEL_GRPC_MTLS_ENABLED", parsedEnv.OTEL_GRPC_MTLS_ENABLED, false),
+        caPath: parsedEnv.OTEL_MTLS_CA_PATH?.trim(),
+        certPath: parsedEnv.OTEL_MTLS_CERT_PATH?.trim(),
+        keyPath: parsedEnv.OTEL_MTLS_KEY_PATH?.trim(),
+      },
+    },
+  },
   pgbouncerMetrics: {
     adminUrl: parsedEnv.PGBOUNCER_METRICS_ADMIN_URL,
     scrapeIntervalMs: parsePositiveIntEnv(
@@ -298,6 +319,7 @@ export const config = {
     /** HTTP methods allowed for cross-origin requests. */
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   },
+  mtls: mtlsConfig,
   jobs: {
     attestationReminder: {
       // Run every minute
@@ -429,6 +451,8 @@ export const config = {
     /** Comma-separated cluster node list, e.g. "host1:7000,host2:7001". */
     clusterNodes: parsedEnv.REDIS_CLUSTER_NODES,
     tls: parseBooleanEnv("REDIS_TLS", parsedEnv.REDIS_TLS, false),
+    /** When true, force single-node Redis mode even if cluster nodes are present. */
+    forceSingleNode: parseBooleanEnv("REDIS_FORCE_SINGLE_NODE", parsedEnv.REDIS_FORCE_SINGLE_NODE, false),
   },
   statsd: {
     host: parsedEnv.STATSD_HOST?.trim() ?? '127.0.0.1',

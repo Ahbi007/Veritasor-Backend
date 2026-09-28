@@ -281,6 +281,51 @@ export const sorobanDrrDequeuesTotal = new Counter({
   registers: [metricsRegistry],
 });
 
+/**
+ * Soroban submit-batching metrics.
+ *
+ * - `soroban_batch_size` (histogram): number of attestation items flushed
+ *   per batch cycle. Buckets are sized to capture typical production batch
+ *   sizes and expose tail behavior for tuning the adaptive flush window.
+ *
+ * - `soroban_batch_flush_total` (counter, labels: trigger): total flush
+ *   cycles grouped by the trigger that initiated them (`size`, `latency`,
+ *   `backpressure`, `manual`). Useful for understanding which threshold
+ *   dominates in production.
+ *
+ * - `soroban_batch_item_errors_total` (counter): items that failed
+ *   individually during a batch flush. Per-item errors must never poison
+ *   successful entries in the same batch.
+ *
+ * - `soroban_batch_queue_depth` (gauge): current number of items waiting
+ *   in the adaptive batch queue.
+ */
+export const sorobanBatchSize = new Histogram({
+  name: 'soroban_batch_size',
+  help: 'Number of attestation items flushed per batch cycle',
+  buckets: [1, 2, 5, 10, 20, 30, 50, 75, 100, 150, 200],
+  registers: [metricsRegistry],
+});
+
+export const sorobanBatchFlushTotal = new Counter({
+  name: 'soroban_batch_flush_total',
+  help: 'Total number of batch flush cycles by trigger type',
+  labelNames: ['trigger'] as const,
+  registers: [metricsRegistry],
+});
+
+export const sorobanBatchItemErrorsTotal = new Counter({
+  name: 'soroban_batch_item_errors_total',
+  help: 'Total number of individual item errors during batch flush',
+  registers: [metricsRegistry],
+});
+
+export const sorobanBatchQueueDepth = new Gauge({
+  name: 'soroban_batch_queue_depth',
+  help: 'Current number of items waiting in the adaptive batch queue',
+  registers: [metricsRegistry],
+});
+
 export const webhookRetryAttempts = new Histogram({
   name: "webhook_retry_attempts",
   help: "Number of retry attempts made when processing a webhook event",
@@ -296,6 +341,20 @@ export const webhookRetryExhaustedTotal = new Counter({
   registers: [metricsRegistry],
 });
 
+export const dlqIngestTotal = new Counter({
+  name: "dlq_ingest_total",
+  help: "Total number of dead-letter queue items ingested",
+  labelNames: ["provider", "reason"] as const,
+  registers: [metricsRegistry],
+});
+
+export const dlqReplayTotal = new Counter({
+  name: "dlq_replay_total",
+  help: "Total number of dead-letter queue items replayed",
+  labelNames: ["provider", "outcome"] as const,
+  registers: [metricsRegistry],
+});
+
 export const redisCircuitBreakerState = new Gauge({
   name: "redis_circuit_breaker_state",
   help: "Redis circuit breaker state (0=CLOSED, 1=OPEN, 2=HALF_OPEN)",
@@ -305,6 +364,26 @@ export const redisCircuitBreakerState = new Gauge({
 export const redisCircuitBreakerFailuresTotal = new Counter({
   name: "redis_circuit_breaker_failures_total",
   help: "Total number of Redis circuit breaker failures recorded",
+  registers: [metricsRegistry],
+});
+
+export const integrationRetryTotal = new Counter({
+  name: "integration_retry_total",
+  help: "Total number of outbound integration retry attempts",
+  labelNames: ["provider", "operation"] as const,
+  registers: [metricsRegistry],
+});
+
+export const integrationRetryBudgetExhaustedTotal = new Counter({
+  name: "integration_retry_budget_exhausted_total",
+  help: "Total number of times the global retry budget was exhausted",
+  labelNames: ["provider", "operation"] as const,
+  registers: [metricsRegistry],
+});
+
+export const integrationRetryBudgetRemaining = new Gauge({
+  name: "integration_retry_budget_remaining",
+  help: "Current remaining retry budget for outbound integrations",
   registers: [metricsRegistry],
 });
 
@@ -388,6 +467,13 @@ export const statsdDualWriteDurationMs = new Histogram({
   name: 'statsd_dual_write_duration_ms',
   help: 'Duration of StatsD dual-write push cycles in milliseconds',
   buckets: [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000],
+  registers: [metricsRegistry],
+});
+
+export const etagHitsTotal = new Counter({
+  name: "etag_hits_total",
+  help: "Total number of ETag-based cache decisions (hit = 304 served, miss = full response)",
+  labelNames: ["route", "result"] as const,
   registers: [metricsRegistry],
 });
 

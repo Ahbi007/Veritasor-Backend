@@ -34,8 +34,8 @@ import { jwksManager } from "./utils/jwks.js";
 import { formatCacheControl, CACHE_POLICIES } from "./utils/cachePolicy.js";
 import { razorpayWebhookRouter } from "./routes/webhooks-razorpay.js";
 import { webhookEgressIpsRouter } from "./routes/webhookEgressIps.js";
+import { webhookSubscriptionsRouter } from "./routes/webhook-subscriptions.js";
 import adminRouter from "./routes/admin.js";
-import adminGraphqlRouter from "./routes/admin.graphql.js";
 import {
   runStartupDependencyReadinessChecks,
   StartupReadinessReport,
@@ -103,6 +103,9 @@ export function createApp(readinessReport: StartupReadinessReport): Express {
   app.use(express.json());
   app.use(createCorsMiddleware());
 
+  // Webhook subscription CRUD API (after body parsing)
+  app.use("/api/v1/webhook-subscriptions", webhookSubscriptionsRouter);
+
   // Response compression (brotli preferred, gzip fallback) with a BREACH guard
   // that refuses to compress responses carrying CSRF tokens or session cookies.
   app.use(compressionMiddleware());
@@ -127,7 +130,6 @@ export function createApp(readinessReport: StartupReadinessReport): Express {
   app.use("/api/users", usersRouter);
   app.use("/api/v1/admin", adminRouter);
   app.use("/api/admin", adminRouter);
-  app.use("/api/v1/admin", adminGraphqlRouter);
 
   app.get("/.well-known/jwks.json", async (_req: Request, res: Response) => {
     await jwksManager.ensureLoaded()

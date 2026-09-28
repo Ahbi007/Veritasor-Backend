@@ -13,7 +13,48 @@ API gateway and attestation service for Veritasor. Handles revenue data normaliz
 - Node.js 18+
 - npm or yarn
 
-## Setup
+## Developer Quickstart (Docker Compose)
+
+The fastest way to get a working development environment is with the included docker-compose stack:
+
+```bash
+# 1. Start Postgres, Redis, and mock Soroban RPC
+docker compose -f ops/dev/docker-compose.yml up -d
+
+# 2. Copy and review environment configuration
+cp .env.example .env
+
+# 3. Install dependencies
+npm install
+
+# 4. Apply database migrations
+npm run migrate
+
+# 5. Run the API in development mode
+npm run dev
+```
+
+The compose file provisions:
+
+| Service  | Port  | Purpose                                      |
+|----------|-------|----------------------------------------------|
+| Postgres | 5432  | Application database with pre-seeded dev data |
+| Redis    | 6379  | Caching, rate limiting, idempotency          |
+| Soroban  | 8000  | Mock Soroban RPC for local attestation flows  |
+
+**Seed data** (tables + data applied automatically on first container start — no separate migration step needed for the seed):
+- Dev user: `dev@veritasor.local` / `devpassword123`
+- Dev business: "Veritasor Demo Inc." owned by the dev user
+- Sample attestation record
+
+To tear down and reset:
+```bash
+docker compose -f ops/dev/docker-compose.yml down -v
+```
+
+## Manual Setup
+
+If you prefer to run services natively:
 
 ```bash
 # Install dependencies
@@ -58,6 +99,44 @@ Tune the TTL (`ttlMs` per route) or the sweep interval (`IDEMPOTENCY_SWEEP_INTER
 Distributed tracing is disabled by default. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to an OTLP/HTTP traces endpoint, such as `http://localhost:4318/v1/traces`, to initialize the OpenTelemetry Node SDK during app startup. The request logger creates one server span per HTTP request and Soroban RPC retries create child client spans, so slow attestation requests can be correlated with individual blockchain attempts.
 
 Trace attributes intentionally exclude request bodies, headers, and raw query strings. Correlation IDs, HTTP method, route/path, status code, user agent, and Soroban operation metadata are emitted; exception messages are redacted before being recorded on custom spans.
+
+## Health Checks & Container Probes
+
+`src/routes/health.ts` exposes three endpoints so orchestrators can distinguish "the process is alive" from "the process can serve traffic":
+
+| Endpoint | Purpose | Checks | Status codes |
+|---|---|---|---|
+| `GET /api/health/live` | Liveness | None — process-only, never touches the DB, Redis, or Soroban | Always `200` while the HTTP server can respond |
+| `GET /api/health/ready` | Readiness | Database (`checkDatabase()` in `src/startup/readiness.ts`), when `DATABASE_URL` is set | `200` when ready, `503` when the dependency is down |
+| `GET /api/health` | Legacy combined check (kept for backward compatibility) | DB + Redis, plus Soroban + Email when called with `?mode=deep` | `200` (`ok`/`degraded`) or `503` (`unhealthy`, deep mode only) |
+
+**Why the split matters:** liveness answers "should the orchestrator restart this container?" and must never fail because of a slow or unavailable dependency — otherwise a database blip triggers unnecessary restarts instead of the orchestrator simply holding traffic back via readiness. `/api/health/ready` reuses the same bounded `checkDatabase()` probe as startup so the running-instance check and the boot-time check can't drift apart. `/api/health` is unchanged and continues to serve existing callers (load balancers, uptime monitors) that expect the combined shape with `mode`, `db`, `redis`, and `dependencies`.
+
+### Kubernetes probe configuration
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /api/health/live
+    port: 3000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /api/health/ready
+    port: 3000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+```
+
+Point `livenessProbe` at `/api/health/live` only — pointing it at `/api/health` or `/api/health/ready` risks a restart loop when a dependency (not the process) is unhealthy. `readinessProbe` should use `/api/health/ready` so the pod is pulled out of the load-balancer rotation during a dependency outage without being killed.
+
+The Docker image's `HEALTHCHECK` (see [Dockerfile](Dockerfile)) also targets `/api/health/live` for the same reason.
 
 ## Attestation Reminders
 
@@ -214,6 +293,45 @@ Peak-load k6 scenarios for `/api/v1/attestations` live in `ops/k6/`.
 - Nightly workflow: `.github/workflows/nightly-k6-attestations.yml`
 - Grafana dashboard: `ops/k6/grafana/peak-attestation-dashboard.json`
 
+### Soak testing (autocannon)
+
+An autocannon-based soak harness measures sustained throughput, p50/p95/p99 latency, and error rates on the attestation submit path. It exits non-zero when p95 or error-rate thresholds are breached, so it can gate CI.
+
+```bash
+# Quick soak (30s, 10 connections)
+SOAK_AUTH_TOKEN=<jwt> npm run soak
+
+# Longer soak with custom thresholds
+SOAK_AUTH_TOKEN=<jwt> SOAK_DURATION=300 SOAK_CONNECTIONS=50 \
+  SOAK_P95_THRESHOLD_MS=300 SOAK_ERROR_RATE_THRESHOLD=0.01 \
+  npm run soak
+
+# CLI flags override env vars
+npm run soak -- --token <jwt> --duration 60 --connections 20
+```
+
+All configuration options:
+
+| Option | Env var | Default | Description |
+|--------|---------|---------|-------------|
+| `--url` | `SOAK_BASE_URL` | `http://127.0.0.1:3000` | Base URL of the running instance |
+| `--path` | `SOAK_PATH` | `/api/v1/attestations` | Attestation endpoint path |
+| `--token` | `SOAK_AUTH_TOKEN` | (required) | JWT auth token |
+| `--duration` | `SOAK_DURATION` | `30` | Duration in seconds |
+| `--connections` | `SOAK_CONNECTIONS` | `10` | Number of concurrent connections |
+| `--businessId` | `SOAK_BUSINESS_ID` | (empty) | Business ID for the request |
+| `--merkleRoot` | `SOAK_MERKLE_ROOT` | `0xab...` | Merkle root hex string |
+| `--p95ThresholdMs` | `SOAK_P95_THRESHOLD_MS` | `500` | p95 latency threshold in ms |
+| `--errorRateThreshold` | `SOAK_ERROR_RATE_THRESHOLD` | `0.01` | Max error rate (0-1) |
+| `--writeRatio` | `SOAK_WRITE_RATIO` | `1.0` | Fraction of requests that are POST writes |
+| `--bailout` | `SOAK_BAILOUT` | `0` | Error count before bail (0 = never bail) |
+| `--timeout` | `SOAK_TIMEOUT` | `10` | Response timeout in seconds |
+
+Edge cases handled:
+- Zero duration or zero connections exits cleanly with code 0.
+- Missing token exits with code 1 and a usage hint.
+- Unreachable server triggers autocannon bailout, prints results, and exits non-zero.
+
 ## API Versioning
 
 Routes may be mounted with an `/api/v{n}` prefix and/or legacy unversioned paths (e.g. `/api/attestations`). The server still resolves a major version for each request.
@@ -228,6 +346,8 @@ Routes may be mounted with an `/api/v{n}` prefix and/or legacy unversioned paths
 | Method | Path                      | Description              | Auth Required |
 |--------|---------------------------|--------------------------|---------------|
 | GET    | `/api/v1/health`          | Health check             | No |
+| GET    | `/api/health/live`        | Liveness probe (process-only) | No |
+| GET    | `/api/health/ready`       | Readiness probe (dependency checks) | No |
 | GET    | `/api/v1/attestations`    | List attestations (stub) | User Auth |
 | POST   | `/api/v1/attestations`    | Submit attestation (stub)| User Auth |
 | GET    | `/api/v1/businesses/me`   | Get user business        | User Auth |
@@ -312,6 +432,12 @@ Optional `.env`:
 ```
 PORT=3000
 DATABASE_URL=postgresql://user:password@localhost:5432/veritasor
+# Redis Configuration (Standalone, Cluster, or Sentinel)
+# REDIS_URL=redis://localhost:6379
+# REDIS_CLUSTER_NODES=localhost:7000,localhost:7001
+REDIS_MODE=sentinel
+REDIS_SENTINELS=localhost:26379,localhost:26380
+REDIS_SENTINEL_NAME=mymaster
 # MIGRATION_LOCK_TIMEOUT_MS=5000
 # MIGRATION_STATEMENT_TIMEOUT_MS=60000
 ```
