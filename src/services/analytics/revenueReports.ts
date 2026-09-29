@@ -83,6 +83,11 @@ const parsePeriod = (value: string, label: string): { year: number; month: numbe
     )
   }
   const [year, month] = value.split('-').map(Number)
+  if (month < 1 || month > 12) {
+    throw new TimeWindowError(
+      `Invalid month for "${label}": "${value}". Month must be between 01 and 12.`,
+    )
+  }
   return { year, month }
 }
 
