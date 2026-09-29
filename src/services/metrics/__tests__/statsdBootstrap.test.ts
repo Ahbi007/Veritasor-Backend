@@ -12,16 +12,18 @@ vi.mock('../../utils/logger.js', () => ({
   logger: mockLogger,
 }));
 
-vi.mock('../../config/index.js', () => ({
-  config: {
-    statsd: {
-      host: '127.0.0.1',
-      port: 8125,
-      prefix: 'veritasor.',
-      dualWriteEnabled: true,
-      dualWriteIntervalMs: 10_000,
-    },
+const mockConfig = {
+  statsd: {
+    host: '127.0.0.1',
+    port: 8125,
+    prefix: 'veritasor.',
+    dualWriteEnabled: true,
+    dualWriteIntervalMs: 10_000,
   },
+};
+
+vi.mock('../../config/index.js', () => ({
+  config: mockConfig,
 }));
 
 vi.mock('../../metrics.js', () => ({
@@ -63,18 +65,43 @@ import { StatsDClient } from '../statsdClient.js';
 describe('statsdBootstrap', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockConfig.statsd.dualWriteEnabled = true;
+  });
+
+  afterEach(async () => {
+    // Ensure module-level handle state is cleared between tests.
+    await stopStatsdDualWriteIfNeeded();
+    vi.clearAllMocks();
   });
 
   describe('startStatsdDualWriteIfEnabled', () => {
     it('creates a StatsD client and starts dual-write when enabled', () => {
       startStatsdDualWriteIfEnabled();
 
-      expect(StatsDClient).toHaveBeenCalledWith({
+      expect(StatsdClient).toHaveBeenCalledWith({
         host: '127.0.0.1',
         port: 8125,
         prefix: 'veritasor.',
       });
-      expect(startStatsdDualWrite).toHaveBeenCalled();
+      expect(startStatsdDualWrite).toHaveBeenCalledWith(
+        expect.objectContaining({
+          intervalMs: 10_000,
+        }),
+      );
+    });
+
+    it('logs initialisation details on successful start', () => {
+      startStatsdDualWriteIfEnabled();
+
+      expect(mockLogger.info).toHaveBeenCalledWith(
+        {
+          host: '127.0.0.1',
+          port: 8125,
+          prefix: 'veritasor.',
+          intervalMs: 10_000,
+        },
+        'Statsd dual-write initialised',
+      );
     });
 
     it('logs a warning and skips if already running', () => {
@@ -84,17 +111,38 @@ describe('statsdBootstrap', () => {
       startStatsdDualWriteIfEnabled();
 
       expect(mockLogger.warn).toHaveBeenCalledWith(
-        'StatsD dual-write already running; ignoring duplicate start',
+        'Statsd dual-write already running; ignoring duplicate start',
       );
       // No second client created
       expect(StatsDClient).not.toHaveBeenCalled();
+      expect(startStatsdDualWrite).not.toHaveBeenCalled();
+    });
+
+    it('does not start dual-write when the feature flag is disabled', () => {
+      mockConfig.statsd.dualWriteEnabled = false;
+
+      startStatsdDualWriteIfEnabled();
+
+      expect(StatsDClient).not.toHaveBeenCalled();
+      expect(startStatsdDualWrite).not.toHaveBeenCalled();
+      expect(mockLogger.info).not.toHaveBeenCalled();
+    });
+
+    it('respects a change to the feature flag between calls', () => {
+      mockConfig.statsd.dualWriteEnabled = false;
+      startStatsdDualWriteIfEnabled();
+      expect(startStatsdDualWrite).not.toHaveBeenCalled();
+
+      mockConfig.statsd.dualWriteEnabled = true;
+      startStatsdDualWriteIfEnabled();
+      expect(startStatsdDualWrite).toHaveBeenCalled();
     });
   });
 
   describe('stopStatsdDualWriteIfNeeded', () => {
     it('is a no-op when nothing is running', async () => {
-      await stopStatsdDualWriteIfNeeded();
-      // Should not throw
+      await expect(stopStatsdDualWriteIfNeeded()).resolves.toBeUndefined();
+      expect(mockLogger.warn).not.toHaveBeenCalled();
     });
 
     it('stops the dual-write handle when running', async () => {
@@ -122,6 +170,17 @@ describe('statsdBootstrap', () => {
       expect(handle.stop).not.toHaveBeenCalled();
     });
 
+    it('allows a fresh start after stopping', async () => {
+      startStatsdDualWriteIfEnabled();
+      await stopStatsdDualWriteIfNeeded();
+
+      vi.clearAllMocks();
+      startStatsdDualWriteIfEnabled();
+
+      expect(StatsdClient).toHaveBeenCalledTimes(1);
+      expect(startStatsdDualWrite).toHaveBeenCalledTimes(1);
+    });
+
     it('logs a warning and clears handle when stop throws', async () => {
       startStatsdDualWriteIfEnabled();
       const handle = (startStatsdDualWrite as ReturnType<typeof vi.fn>).mock
@@ -134,32 +193,26 @@ describe('statsdBootstrap', () => {
 
       expect(mockLogger.warn).toHaveBeenCalledWith(
         { err: 'close failed' },
-        'StatsD dual-write stop error',
+        'Statsd dual-write stop error',
       );
 
       // Handle should be cleared even after error
       await stopStatsdDualWriteIfNeeded();
       expect(handle.stop).toHaveBeenCalledTimes(1);
     });
-  });
 
-  describe('feature flag off', () => {
-    it('does not start dual-write when STATSD_DUAL_WRITE_ENABLED is false', async () => {
-      // Reload config mock with enabled=false
-      const configModule = await import('../../config/index.js');
-      (configModule.config as any).statsd.dualWriteEnabled = false;
+    it('surfaces non-Error rejections with a stable message', async () => {
+      startStatsdDualWriteIfEnabled();
+      const handle = (startStatsdDualWrite as ReturnType<typeof vi.fn>).mock
+        .results[0].value;
+      (handle.stop as ReturnType<typeof vi.fn>).mockRejectedValueOnce('boom');
 
-      // Reset the module state by stopping if needed
       await stopStatsdDualWriteIfNeeded();
 
-      vi.clearAllMocks();
-      startStatsdDualWriteIfEnabled();
-
-      expect(StatsDClient).not.toHaveBeenCalled();
-      expect(startStatsdDualWrite).not.toHaveBeenCalled();
-
-      // Restore for other tests
-      (configModule.config as any).statsd.dualWriteEnabled = true;
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        { err: 'undefined' },
+        'Statsd dual-write stop error',
+      );
     });
   });
 });
