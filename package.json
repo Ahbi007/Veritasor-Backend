@@ -109,5 +109,14 @@
     "vite": "^8.1.0",
     "vitest": "^4.1.10"
   },
-  "overrides": {}
+  "overrides": {},
+  "pnpm.onlyBuiltDependencies": [
+    "cpu-features",
+    "esbuild",
+    "libxmljs2",
+    "protobufjs",
+    "ssh2",
+    "unix-dgram",
+    "unrs-resolver"
+  ]
 }
